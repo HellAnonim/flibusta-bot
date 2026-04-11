@@ -1,0 +1,25 @@
+{
+  "webdav": {
+    "base_url": "https://alisoman-new.keenetic.pro/webdav/",
+    "username": "claw",
+    "password": "REPLACE_ME"
+  },
+  "archive_webdav": {
+    "username": "claw2",
+    "password": "REPLACE_ME"
+  },
+  "telegram": {
+    "bot_token": "REPLACE_ME"
+  },
+  "routing": {
+    "default_email": "v_rostislav@kindle.com",
+    "user_email_map": {
+      "427611": "v_rostislav@kindle.com"
+    }
+  },
+  "smtp_creds_path": "/root/.openclaw/.smtp_gmail_credentials",
+  "otp_notify_chat_id": "427611",
+  "max_email_bytes": 15728640,
+  "ru_only_search": true,
+  "work_dir": "/root/.openclaw/workspace/book/runtime"
+}

@@ -258,10 +258,10 @@ class LibraryBotCore:
     def search(self, query: str, limit: int = 20) -> List[dict]:
         self.ensure_index_current_for_send()
         tokens = [t.lower() for t in re.split(r'\s+', query.strip()) if t.strip()]
-        ru_only = bool(self.cfg.get('ru_only_search', True))
+        language = str(self.cfg.get('language', 'ru')).lower().strip()
         out = []
         for b in self._iter_books():
-            if ru_only and not self._is_russian_book(b):
+            if language == 'ru' and not self._is_russian_book(b):
                 continue
             hay = f"{b.get('authors','')} {b.get('title','')}".lower()
             if all(t in hay for t in tokens):

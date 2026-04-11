@@ -17,7 +17,7 @@
   },
   "otp_notify_chat_id": "123456",
   "max_email_bytes": 15728640,
-  "ru_only_search": true,
+  "language": "ru",
   "inpx_name": "/path/to/flibusta_fb2_local.inpx",
   "work_dir": "/path/to/flibusta/runtime"
 }

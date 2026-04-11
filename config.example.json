@@ -3,14 +3,20 @@
     "bot_token": "REPLACE_ME"
   },
   "routing": {
-    "default_email": "v_rostislav@kindle.com",
     "user_email_map": {
-      "427611": "v_rostislav@kindle.com"
+      "TelegramID": "email for Kindle"
     }
   },
-  "smtp_creds_path": "/root/.openclaw/.smtp_gmail_credentials",
-  "otp_notify_chat_id": "427611",
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "username": "your_mail@gmail.com",
+    "password": "your_app_password",
+    "from_email": "your_mail@gmail.com",
+    "use_tls": true
+  },
+  "otp_notify_chat_id": "123456",
   "max_email_bytes": 15728640,
   "ru_only_search": true,
-  "work_dir": "/root/.openclaw/workspace/book/runtime"
+  "work_dir": "/path/to/flibusta/runtime"
 }

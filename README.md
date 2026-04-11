@@ -1,6 +1,6 @@
 # Flibusta Library Bot
 
-Telegram-бот для поиска и отправки книг из Flibusta через INPX + сайт flibusta + email.
+Telegram-бот для поиска и отправки книг из Flibusta, использует локальный INPX для поиска, сайт flibusta.is для загрузки и email для доставки.
 
 ## Что умеет
 

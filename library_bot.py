@@ -563,7 +563,7 @@ class LibraryBotCore:
         menu_kb = {
             'keyboard': [
                 [{'text': '🔎 Поиск книги'}],
-                [{'text': '❓ Помощь'}]
+                [{'text': '⚙️ Формат'}, {'text': '❓ Помощь'}]
             ],
             'resize_keyboard': True,
             'is_persistent': True
@@ -706,7 +706,7 @@ class LibraryBotCore:
                         continue
 
                     # /format command
-                    if text.strip() == '/format':
+                    if text.strip() in ('/format', '⚙️ Формат'):
                         current_fmt = pref.get('book_format', 'epub')
                         requests.post(f'{base}/sendMessage', json={
                             'chat_id': chat_id,

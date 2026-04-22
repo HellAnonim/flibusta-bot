@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -21,6 +22,12 @@ from typing import Dict, List, Tuple
 
 import requests
 
+from runtime_store import RuntimeStore
+from telegram_ui import books_human_list, is_valid_email, normalize_email, pagination_keyboard, render_search_page
+from delivery_service import DeliveryService
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Book:
@@ -32,338 +39,112 @@ class Book:
     ext: str
 
 
+def configure_logging() -> None:
+    level_name = os.environ.get('LIBRARY_BOT_LOG_LEVEL', 'INFO').upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format='%(asctime)s %(levelname)s [%(name)s] %(message)s')
+
+
 class LibraryBotCore:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.base_url = cfg['webdav']['base_url'].rstrip('/') + '/'
-        self.auth = (cfg['webdav']['username'], cfg['webdav']['password'])
-        arc_cfg = cfg.get('archive_webdav') or {}
-        if arc_cfg.get('username') and arc_cfg.get('password'):
-            self.archive_auth = (arc_cfg['username'], arc_cfg['password'])
-        else:
-            self.archive_auth = self.auth
         self.runtime = Path(cfg.get('work_dir', '/root/.openclaw/workspace/book/runtime'))
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.index_path = self.runtime / 'books_index.jsonl'
         self.inpx_cache_path = self.runtime / 'flibusta_fb2_local.inpx'
-        self.inpx_meta_path = self.runtime / 'inpx_meta.json'
-        self.last_results_path = self.runtime / 'last_results_by_tg.json'
-        self.dialog_state_path = self.runtime / 'dialog_state_by_tg.json'
-        self.auth_state_path = self.runtime / 'auth_state_by_tg.json'
-        self.user_prefs_path = self.runtime / 'user_prefs_by_tg.json'
+        self.store = RuntimeStore(self.runtime)
         self.users_path = self.runtime / 'users.json'
         self.sent_log_path = self.runtime / 'book_send_log.txt'
         self.sent_index_path = self.runtime / 'sent_books_by_tg.json'
         self.smtp_path = Path(cfg['smtp_creds_path'])
         self.max_email_bytes = int(cfg.get('max_email_bytes', 15 * 1024 * 1024))
+        self.delivery = DeliveryService(self.smtp_path, self.max_email_bytes)
         self.search_page_size = int(cfg.get('search_page_size', 3))
 
-    def _webdav_get(self, rel_path: str, auth: tuple[str, str] | None = None) -> bytes:
-        url = self.base_url + rel_path.lstrip('/')
-        auth_use = auth or self.auth
-        last_err = None
-        for i in range(6):
-            try:
-                r = requests.get(url, auth=auth_use, timeout=120)
-                r.raise_for_status()
-                return r.content
-            except Exception as e:
-                last_err = e
-                time.sleep(min(2 + i, 10))
-        raise last_err
-
-    def _webdav_head(self, rel_path: str) -> dict:
-        url = self.base_url + rel_path.lstrip('/')
-        r = requests.head(url, auth=self.auth, timeout=30)
-        if r.status_code >= 400:
-            raise RuntimeError(f'HEAD failed: {r.status_code}')
-        return {
-            'etag': (r.headers.get('ETag') or '').strip(),
-            'last_modified': (r.headers.get('Last-Modified') or '').strip(),
-            'content_length': (r.headers.get('Content-Length') or '').strip(),
-        }
-
     def _load_inpx_meta(self) -> dict:
-        if self.inpx_meta_path.exists():
-            return json.loads(self.inpx_meta_path.read_text(encoding='utf-8'))
-        return {}
-
-    def _save_inpx_meta(self, data: dict) -> None:
-        self.inpx_meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        return self.store.load_inpx_meta()
 
     def ensure_local_inpx_fresh(self, force: bool = False) -> bool:
         """Returns True if local INPX was updated."""
         inpx_name = self.cfg.get('inpx_name', 'flibusta_fb2_local.inpx')
         inpx_path = Path(inpx_name)
+        if not inpx_path.is_absolute():
+            inpx_path = Path.cwd() / inpx_path
+        if not inpx_path.exists():
+            raise RuntimeError(f'Local INPX file not found: {inpx_path}')
 
-        if inpx_path.is_absolute() and inpx_path.exists():
-            src_stat = inpx_path.stat()
-            local_meta = self._load_inpx_meta()
-            need_copy = force or (not self.inpx_cache_path.exists()) or str(src_stat.st_mtime_ns) != str(local_meta.get('mtime_ns')) or str(src_stat.st_size) != str(local_meta.get('content_length'))
-            if need_copy:
-                self.inpx_cache_path.write_bytes(inpx_path.read_bytes())
-                self._save_inpx_meta({
-                    'source': str(inpx_path),
-                    'mtime_ns': str(src_stat.st_mtime_ns),
-                    'content_length': str(src_stat.st_size),
-                    'updated_at': int(time.time()),
-                })
-                return True
-            return False
-
-        remote = None
-        try:
-            remote = self._webdav_head(inpx_name)
-        except Exception:
-            remote = None
-
+        src_stat = inpx_path.stat()
         local_meta = self._load_inpx_meta()
-        need_download = force or (not self.inpx_cache_path.exists())
-
-        if remote and not need_download:
-            if (remote.get('etag') and remote.get('etag') != local_meta.get('etag')) or \
-               (remote.get('last_modified') and remote.get('last_modified') != local_meta.get('last_modified')) or \
-               (remote.get('content_length') and remote.get('content_length') != local_meta.get('content_length')):
-                need_download = True
-
-        if need_download:
-            data = self._webdav_get(inpx_name)
-            self.inpx_cache_path.write_bytes(data)
-            new_meta = {
-                'source': inpx_name,
-                'etag': (remote or {}).get('etag', ''),
-                'last_modified': (remote or {}).get('last_modified', ''),
-                'content_length': (remote or {}).get('content_length', ''),
+        need_copy = (
+            force
+            or (not self.inpx_cache_path.exists())
+            or str(src_stat.st_mtime_ns) != str(local_meta.get('mtime_ns'))
+            or str(src_stat.st_size) != str(local_meta.get('content_length'))
+        )
+        if need_copy:
+            self.inpx_cache_path.write_bytes(inpx_path.read_bytes())
+            self.store.save_inpx_meta({
+                'source': str(inpx_path),
+                'mtime_ns': str(src_stat.st_mtime_ns),
+                'content_length': str(src_stat.st_size),
                 'updated_at': int(time.time()),
-            }
-            self._save_inpx_meta(new_meta)
+            })
             return True
-
         return False
 
     def _load_smtp(self) -> dict:
-        out = {}
-        for line in self.smtp_path.read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            out[k.strip()] = v.strip()
-        return out
-
-    def build_index(self) -> int:
-        # keep local INPX cache on server
-        self.ensure_local_inpx_fresh(force=not self.inpx_cache_path.exists())
-        if not self.inpx_cache_path.exists():
-            raise RuntimeError('INPX cache is missing and cannot be downloaded')
-        zf = zipfile.ZipFile(self.inpx_cache_path)
-
-        structure = None
-        if 'structure.info' in zf.namelist():
-            structure = zf.read('structure.info').decode('utf-8', errors='ignore').strip()
-            structure = [s.strip().lower() for s in re.split(r'[;|,]', structure) if s.strip()]
-
-        count = 0
-        with self.index_path.open('w', encoding='utf-8') as f:
-            for name in zf.namelist():
-                if not name.lower().endswith('.inp'):
-                    continue
-                archive_base = Path(name).stem
-                text = zf.read(name).decode('utf-8', errors='ignore')
-                for line in text.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split('\x04')
-                    title, authors, file_base, ext, lang = self._extract_fields(parts, structure)
-                    if not file_base:
-                        continue
-                    book = {
-                        'book_id': f'{archive_base}:{file_base}',
-                        'title': title or '',
-                        'authors': authors or '',
-                        'archive_base': archive_base,
-                        'file_base': file_base,
-                        'ext': (ext or 'fb2').lower(),
-                        'lang': (lang or '').lower(),
-                    }
-                    f.write(json.dumps(book, ensure_ascii=False) + '\n')
-                    count += 1
-        return count
-
-    @staticmethod
-    def _extract_fields(parts: List[str], structure: List[str] | None) -> Tuple[str, str, str, str, str]:
-        # fallback heuristics for common flibusta layout
-        title = parts[2] if len(parts) > 2 else ''
-        authors = parts[0] if len(parts) > 0 else ''
-        file_base = parts[5] if len(parts) > 5 else (parts[0] if parts else '')
-        ext = parts[8] if len(parts) > 8 else 'fb2'
-        lang = parts[11] if len(parts) > 11 else ''
-
-        if structure:
-            field = {structure[i]: parts[i] for i in range(min(len(structure), len(parts)))}
-            title = field.get('title', title)
-            authors = field.get('author', field.get('authors', authors))
-            file_base = field.get('file', field.get('filename', file_base))
-            ext = field.get('ext', ext)
-            lang = field.get('lang', field.get('language', lang))
-        return title, authors, file_base, ext, lang
-
-    def ensure_index_current_for_send(self) -> None:
-        updated = self.ensure_local_inpx_fresh(force=False)
-        if updated or (not self.index_path.exists()):
-            self.build_index()
-
-    def _iter_books(self):
-        if not self.index_path.exists():
-            raise RuntimeError('Index not found. Run index first.')
-        with self.index_path.open('r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    yield json.loads(line)
-
-    @staticmethod
-    def _normalize_authors(authors: str) -> str:
-        text = (authors or '').strip().strip(':').strip()
-        parts = [p.strip() for p in text.split(':') if p.strip()]
-        if parts:
-            text = parts[0]
-        chunks = [c.strip() for c in text.split(',') if c.strip()]
-        if len(chunks) >= 2:
-            return ' '.join(chunks)
-        return text or 'Автор не указан'
-
-    @staticmethod
-    def _looks_russian_by_text(text: str) -> bool:
-        if not text:
-            return False
-        cyr = len(re.findall(r'[А-Яа-яЁё]', text))
-        lat = len(re.findall(r'[A-Za-z]', text))
-        if cyr == 0:
-            return False
-        # stricter: mostly Cyrillic text
-        return cyr >= (lat * 2)
-
-    def _is_russian_book(self, b: dict) -> bool:
-        lang = (b.get('lang') or '').lower().strip()
-        if lang:
-            if lang.startswith('ru') or 'рус' in lang:
-                return True
-            # explicit non-ru language mark
-            if lang.startswith(('en', 'de', 'fr', 'es', 'it', 'pl', 'tr', 'uk')):
-                return False
-        txt = f"{b.get('authors','')} {b.get('title','')}"
-        return self._looks_russian_by_text(txt)
-
-    def search(self, query: str, limit: int = 20) -> List[dict]:
-        self.ensure_index_current_for_send()
-        tokens = [t.lower() for t in re.split(r'\s+', query.strip()) if t.strip()]
-        language = str(self.cfg.get('language', 'ru')).lower().strip()
-        out = []
-        for b in self._iter_books():
-            if language == 'ru' and not self._is_russian_book(b):
-                continue
-            hay = f"{b.get('authors','')} {b.get('title','')}".lower()
-            if all(t in hay for t in tokens):
-                result = dict(b)
-                result['authors'] = self._normalize_authors(result.get('authors', ''))
-                result['download_epub'] = f"https://flibusta.is/b/{b['file_base']}/epub"
-                result['book_id'] = b.get('file_base') or b.get('book_id')
-                out.append(result)
-                if len(out) >= limit:
-                    break
-        return out
+        return self.delivery.load_smtp()
 
     def fetch_book_epub(self, book: dict, out_dir: Path) -> Path:
-        url = book.get('download_epub') or f"https://flibusta.is/b/{book['book_id']}/epub"
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_name = self._safe_book_filename(book.get('authors',''), book.get('title',''), str(book.get('book_id','book'))) + '.epub'
-        epub_path = out_dir / out_name
-        epub_path.write_bytes(r.content)
-        return epub_path
+        return self.delivery.fetch_book_epub(book, out_dir)
 
     @staticmethod
     def _safe_book_filename(authors: str, title: str, fallback: str) -> str:
-        base = f"{title} - {authors}".strip(' -')
-        if not base:
-            base = fallback
-        base = re.sub(r'[\\/:*?"<>|]+', ' ', base)
-        base = re.sub(r'\s+', ' ', base).strip()
-        return base[:120] if base else fallback
+        return DeliveryService.safe_book_filename(authors, title, fallback)
 
     def convert_fb2_to_epub(self, fb2_path: Path, title: str = '', authors: str = '', fallback: str = 'book') -> Path:
-        out_name = self._safe_book_filename(authors, title, fallback) + '.epub'
-        epub = fb2_path.with_name(out_name)
-        cmd = ['ebook-convert', str(fb2_path), str(epub)]
-        if title:
-            cmd += ['--title', title]
-        if authors:
-            cmd += ['--authors', authors]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return epub
+        return self.delivery.convert_fb2_to_epub(fb2_path, title=title, authors=authors, fallback=fallback)
 
     def send_epubs_by_email(self, tg_id: str, epub_paths: List[Path], to_email_override: str | None = None) -> tuple[int, str]:
-        users = {}
-        if self.users_path.exists():
-            try:
-                users = json.loads(self.users_path.read_text(encoding='utf-8'))
-            except Exception:
-                users = {}
-        user_email = None
-        if isinstance(users.get(str(tg_id)), dict):
-            user_email = users.get(str(tg_id), {}).get('email')
-        to_email = to_email_override or user_email
-        if not to_email:
-            raise RuntimeError(f'No target email in users.json for telegram id {tg_id}')
+        return self.delivery.send_epubs_by_email(tg_id, epub_paths, self.users_path, to_email_override=to_email_override)
 
-        smtp = self._load_smtp()
-        batches = []
-        cur, cur_size = [], 0
-        for p in epub_paths:
-            sz = p.stat().st_size
-            if cur and cur_size + sz > self.max_email_bytes:
-                batches.append(cur)
-                cur, cur_size = [], 0
-            cur.append(p)
-            cur_size += sz
-        if cur:
-            batches.append(cur)
+    @staticmethod
+    def _merge_user_pref(existing: dict | None, updates: dict | None) -> dict:
+        result = dict(existing or {})
+        for key, value in (updates or {}).items():
+            if value is not None:
+                result[key] = value
+        return result
 
-        for i, batch in enumerate(batches, 1):
-            msg = EmailMessage()
-            msg['From'] = smtp['FROM_EMAIL']
-            msg['To'] = to_email
-            msg['Subject'] = f'Library Bot books [{i}/{len(batches)}]'
-            msg.set_content('Книги во вложении. Sent by library_bot.')
-            for p in batch:
-                msg.add_attachment(
-                    p.read_bytes(),
-                    maintype='application',
-                    subtype='epub+zip',
-                    filename=p.name,
-                )
-            with smtplib.SMTP_SSL(smtp['SMTP_HOST'], int(smtp['SMTP_PORT'])) as s:
-                s.login(smtp['SMTP_USER'], smtp['SMTP_PASS'])
-                s.send_message(msg)
-        return len(batches), to_email
+    @staticmethod
+    def _books_human_list(books: List[dict]) -> str:
+        return books_human_list(books)
+
+    @staticmethod
+    def _normalize_email(value: str) -> str:
+        return normalize_email(value)
+
+    @staticmethod
+    def _is_valid_email(value: str) -> bool:
+        return is_valid_email(value)
+
+    def _render_search_page(self, found: List[dict], page: int) -> str:
+        return render_search_page(found, page, self.search_page_size)
+
+    def _pagination_keyboard(self, page: int, total_items: int) -> dict | None:
+        return pagination_keyboard(page, total_items, self.search_page_size)
 
     def _load_last_results(self) -> Dict[str, List[dict]]:
-        if self.last_results_path.exists():
-            return json.loads(self.last_results_path.read_text(encoding='utf-8'))
-        return {}
+        return self.store.load_last_results()
 
     def _save_last_results(self, data: Dict[str, List[dict]]) -> None:
-        self.last_results_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        self.store.save_last_results(data)
 
     def _load_dialog_state(self) -> Dict[str, dict]:
-        if self.dialog_state_path.exists():
-            return json.loads(self.dialog_state_path.read_text(encoding='utf-8'))
-        return {}
+        return self.store.load_dialog_state()
 
     def _save_dialog_state(self, data: Dict[str, dict]) -> None:
-        self.dialog_state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        self.store.save_dialog_state(data)
 
     def _load_auth_state(self) -> Dict[str, dict]:
         if self.users_path.exists():
@@ -386,9 +167,7 @@ class LibraryBotCore:
                         out[tg_id] = entry
                 return out
             except Exception:
-                pass
-        if self.auth_state_path.exists():
-            return json.loads(self.auth_state_path.read_text(encoding='utf-8'))
+                logger.exception("Failed to load auth state from users.json")
         return {}
 
     def _save_auth_state(self, data: Dict[str, dict]) -> None:
@@ -397,6 +176,7 @@ class LibraryBotCore:
             try:
                 users = json.loads(self.users_path.read_text(encoding='utf-8'))
             except Exception:
+                logger.exception("Failed to load users.json for email delivery")
                 users = {}
         for tg_id, info in data.items():
             users.setdefault(tg_id, {})
@@ -412,7 +192,7 @@ class LibraryBotCore:
                     users[tg_id]['otp_expires_at'] = info.get('expires_at')
                 elif 'otp_expires_at' in users[tg_id]:
                     users[tg_id].pop('otp_expires_at', None)
-        self.users_path.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding='utf-8')
+        RuntimeStore.write_json_atomic(self.users_path, users)
 
     def _notify_owner_otp(self, tg_id: str, otp: str) -> None:
         owner = str(self.cfg.get('otp_notify_chat_id', '427611'))
@@ -441,7 +221,7 @@ class LibraryBotCore:
                         result[k] = pref
                 return result
             except Exception:
-                pass
+                logger.exception("Failed to load auth state from users.json")
         return {}
 
     def _save_user_prefs(self, data: Dict[str, dict]) -> None:
@@ -450,22 +230,17 @@ class LibraryBotCore:
             try:
                 users = json.loads(self.users_path.read_text(encoding='utf-8'))
             except Exception:
+                logger.exception("Failed to load users.json for email delivery")
                 users = {}
         for tg_id, pref in data.items():
-            users.setdefault(tg_id, {})
-            if isinstance(pref, dict) and pref.get('email'):
-                users[tg_id]['email'] = pref.get('email')
-            if isinstance(pref, dict) and pref.get('book_format'):
-                users[tg_id]['book_format'] = pref.get('book_format')
-        self.users_path.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding='utf-8')
+            users[tg_id] = self._merge_user_pref(users.get(tg_id), pref if isinstance(pref, dict) else {})
+        RuntimeStore.write_json_atomic(self.users_path, users)
 
     def _load_sent_index(self) -> Dict[str, dict]:
-        if self.sent_index_path.exists():
-            return json.loads(self.sent_index_path.read_text(encoding='utf-8'))
-        return {}
+        return self.store.load_sent_index()
 
     def _save_sent_index(self, data: Dict[str, dict]) -> None:
-        self.sent_index_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        self.store.save_sent_index(data)
 
     def _append_send_log(self, tg_id: str, to_email: str, books: List[dict], parts: int, duplicate: bool = False) -> None:
         ts = datetime.now(ZoneInfo('Europe/Moscow')).strftime('%Y-%m-%d %H:%M:%S MSK')
@@ -477,75 +252,6 @@ class LibraryBotCore:
         lines.append('')
         with self.sent_log_path.open('a', encoding='utf-8') as f:
             f.write('\n'.join(lines))
-
-    @staticmethod
-    def _books_human_list(books: List[dict]) -> str:
-        chunks = []
-        for b in books:
-            title = (b.get('title') or 'Без названия').strip()
-            authors = (b.get('authors') or 'Автор не указан').strip()
-            chunks.append(f'{title} — {authors}')
-        return '; '.join(chunks)
-
-    @staticmethod
-    def _normalize_email(value: str) -> str:
-        e = value.strip()
-        e = re.sub(r'\s+', '', e)
-        e = e.replace('..', '.')
-        return e
-
-    @staticmethod
-    def _is_valid_email(value: str) -> bool:
-        e = LibraryBotCore._normalize_email(value)
-        return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", e))
-
-    def _render_search_page(self, found: List[dict], page: int) -> str:
-        page_size = max(1, self.search_page_size)
-        total = len(found)
-        total_pages = max(1, (total + page_size - 1) // page_size)
-        page = max(1, min(page, total_pages))
-        start = (page - 1) * page_size
-        chunk = found[start:start + page_size]
-
-        lines = []
-        for i, b in enumerate(chunk, start=start + 1):
-            title = b.get('title', '').strip() or 'Без названия'
-            authors = b.get('authors', '').strip() or 'Автор не указан'
-            series = (b.get('series') or '').strip()
-            lang = (b.get('lang') or 'ru').strip()
-            if lines:
-                lines.append('')
-            lines.append(f'{title} - {lang}')
-            if series:
-                lines.append(series)
-            lines.append(authors)
-            lines.append(f'Номер для отправки: {i}')
-        lines.append('')
-        lines.append('Для отправки книг введите их номера.')
-        return '\n'.join(lines)
-
-    def _pagination_keyboard(self, page: int, total_items: int) -> dict | None:
-        page_size = max(1, self.search_page_size)
-        total_pages = max(1, (total_items + page_size - 1) // page_size)
-        if total_pages <= 1:
-            return None
-
-        buttons = []
-        buttons.append({'text': f'• {page} •', 'callback_data': f'pg:{page}'})
-        if page + 1 <= total_pages:
-            buttons.append({'text': str(page + 1), 'callback_data': f'pg:{page + 1}'})
-        if page + 2 <= total_pages:
-            buttons.append({'text': str(page + 2), 'callback_data': f'pg:{page + 2}'})
-        if page + 3 <= total_pages:
-            buttons.append({'text': f'{page + 3} ›', 'callback_data': f'pg:{page + 3}'})
-        if total_pages != page and (not buttons or buttons[-1].get('callback_data') != f'pg:{total_pages}'):
-            buttons.append({'text': f'{total_pages} »', 'callback_data': f'pg:{total_pages}'})
-
-        return {
-            'inline_keyboard': [
-                buttons
-            ]
-        }
 
     def run_telegram_bot(self):
         token = self.cfg['telegram']['bot_token']
@@ -563,7 +269,7 @@ class LibraryBotCore:
         menu_kb = {
             'keyboard': [
                 [{'text': '🔎 Поиск книги'}],
-                [{'text': '⚙️ Формат'}, {'text': '❓ Помощь'}]
+                [{'text': '❓ Помощь'}]
             ],
             'resize_keyboard': True,
             'is_persistent': True
@@ -644,11 +350,15 @@ class LibraryBotCore:
                                 prefs.setdefault(tg_id, {})
                                 prefs[tg_id]['book_format'] = fmt
                                 self._save_user_prefs(prefs)
+                                state = self._load_dialog_state()
+                                if state.get(tg_id, {}).get('await') == 'format_input':
+                                    state[tg_id] = {}
+                                    self._save_dialog_state(state)
                                 send(chat_id_cb, f'✅ Формат книг сохранён: {fmt}', reply_markup=menu_kb)
                         if cq_id:
                             requests.post(f'{base}/answerCallbackQuery', json={'callback_query_id': cq_id}, timeout=30)
                     except Exception:
-                        pass
+                        logger.exception("Callback handling failed")
                     continue
 
                 msg = upd.get('message', {})
@@ -1009,6 +719,7 @@ def cmd_runbot(core: LibraryBotCore, _args):
 
 
 def main():
+    configure_logging()
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True)
     sp = p.add_subparsers(dest='cmd', required=True)

@@ -235,6 +235,15 @@ class LibraryBotCore:
                 result[key] = value
         return result
 
+    def _store_user_email(self, tg_id: str, email: str, current_pref: dict | None = None) -> None:
+        prefs = self._load_user_prefs()
+        prefs[tg_id] = {
+            'email': email,
+            'book_format': (current_pref or {}).get('book_format', 'epub'),
+        }
+        self._save_user_prefs(prefs)
+
+
     @staticmethod
     def _books_human_list(books: List[dict]) -> str:
         return books_human_list(books)
@@ -555,8 +564,7 @@ class LibraryBotCore:
                                 em = text.split(' ', 1)[1].strip()
                             em = self._normalize_email(em)
                             if self._is_valid_email(em):
-                                prefs[tg_id] = {'email': em, 'book_format': pref.get('book_format', 'epub')}
-                                self._save_user_prefs(prefs)
+                                self._store_user_email(tg_id, em, pref)
                                 state[tg_id] = {'await': 'format_input'}
                                 self._save_dialog_state(state)
                                 send(chat_id, f'✅ Email сохранён: {em}\nТеперь выберите формат книг по умолчанию:', reply_markup=format_manage_kb())
@@ -566,26 +574,10 @@ class LibraryBotCore:
 
                     # first-time email capture for delivery
                     if not pref.get('email'):
-                        if st.get('await') == 'email_input':
-                            em = text.strip()
-                            if text.startswith('/email '):
-                                em = text.split(' ', 1)[1].strip()
-                            em = self._normalize_email(em)
-                            if self._is_valid_email(em):
-                                prefs[tg_id] = {'email': em, 'book_format': pref.get('book_format', 'epub')}
-                                self._save_user_prefs(prefs)
-                                state[tg_id] = {'await': 'format_input'}
-                                self._save_dialog_state(state)
-                                send(chat_id, f'✅ Email сохранён: {em}\nТеперь выберите формат книг по умолчанию:', reply_markup=format_manage_kb())
-                            else:
-                                send(chat_id, '❌ Некорректный email. Введите email в формате user@kindle.com', reply_markup=menu_kb)
-                            continue
-
                         if text.startswith('/email '):
                             em = self._normalize_email(text.split(' ', 1)[1].strip())
                             if self._is_valid_email(em):
-                                prefs[tg_id] = {'email': em, 'book_format': pref.get('book_format', 'epub')}
-                                self._save_user_prefs(prefs)
+                                self._store_user_email(tg_id, em, pref)
                                 state[tg_id] = {'await': 'format_input'}
                                 self._save_dialog_state(state)
                                 send(chat_id, f'✅ Email сохранён: {em}\nТеперь выберите формат книг по умолчанию:', reply_markup=format_manage_kb())

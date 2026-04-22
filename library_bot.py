@@ -95,6 +95,125 @@ class LibraryBotCore:
     def _load_smtp(self) -> dict:
         return self.delivery.load_smtp()
 
+    def build_index(self) -> int:
+        self.ensure_local_inpx_fresh(force=False)
+        if not self.inpx_cache_path.exists():
+            raise RuntimeError(f'Local INPX cache not found: {self.inpx_cache_path}')
+
+        with zipfile.ZipFile(self.inpx_cache_path, 'r') as zf:
+            structure = None
+            if 'structure.info' in zf.namelist():
+                structure = zf.read('structure.info').decode('utf-8', errors='ignore').strip()
+                structure = [s.strip().lower() for s in re.split(r'[;|,]', structure) if s.strip()]
+
+            count = 0
+            with self.index_path.open('w', encoding='utf-8') as f:
+                for name in zf.namelist():
+                    if not name.lower().endswith('.inp'):
+                        continue
+                    archive_base = Path(name).stem
+                    text = zf.read(name).decode('utf-8', errors='ignore')
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split('\x04')
+                        title, authors, file_base, ext, lang = self._extract_fields(parts, structure)
+                        if not file_base:
+                            continue
+                        book = {
+                            'book_id': f'{archive_base}:{file_base}',
+                            'title': title or '',
+                            'authors': authors or '',
+                            'archive_base': archive_base,
+                            'file_base': file_base,
+                            'ext': (ext or 'fb2').lower(),
+                            'lang': (lang or '').lower(),
+                        }
+                        f.write(json.dumps(book, ensure_ascii=False) + '\n')
+                        count += 1
+        return count
+
+    @staticmethod
+    def _extract_fields(parts: List[str], structure: List[str] | None) -> Tuple[str, str, str, str, str]:
+        title = parts[2] if len(parts) > 2 else ''
+        authors = parts[0] if len(parts) > 0 else ''
+        file_base = parts[5] if len(parts) > 5 else (parts[0] if parts else '')
+        ext = parts[8] if len(parts) > 8 else 'fb2'
+        lang = parts[11] if len(parts) > 11 else ''
+
+        if structure:
+            field = {structure[i]: parts[i] for i in range(min(len(structure), len(parts)))}
+            title = field.get('title', title)
+            authors = field.get('author', field.get('authors', authors))
+            file_base = field.get('file', field.get('filename', file_base))
+            ext = field.get('ext', ext)
+            lang = field.get('lang', field.get('language', lang))
+        return title, authors, file_base, ext, lang
+
+    def ensure_index_current_for_send(self) -> None:
+        updated = self.ensure_local_inpx_fresh(force=False)
+        if updated or (not self.index_path.exists()):
+            self.build_index()
+
+    def _iter_books(self):
+        if not self.index_path.exists():
+            raise RuntimeError('Index not found. Run index first.')
+        with self.index_path.open('r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)
+
+    @staticmethod
+    def _normalize_authors(authors: str) -> str:
+        text = (authors or '').strip().strip(':').strip()
+        parts = [p.strip() for p in text.split(':') if p.strip()]
+        if parts:
+            text = parts[0]
+        chunks = [c.strip() for c in text.split(',') if c.strip()]
+        if len(chunks) >= 2:
+            return ' '.join(chunks)
+        return text or 'Автор не указан'
+
+    @staticmethod
+    def _looks_russian_by_text(text: str) -> bool:
+        if not text:
+            return False
+        cyr = len(re.findall(r'[А-Яа-яЁё]', text))
+        lat = len(re.findall(r'[A-Za-z]', text))
+        if cyr == 0:
+            return False
+        return cyr >= (lat * 2)
+
+    def _is_russian_book(self, b: dict) -> bool:
+        lang = (b.get('lang') or '').lower().strip()
+        if lang:
+            if lang.startswith('ru') or 'рус' in lang:
+                return True
+            if lang.startswith(('en', 'de', 'fr', 'es', 'it', 'pl', 'tr', 'uk')):
+                return False
+        txt = f"{b.get('authors','')} {b.get('title','')}"
+        return self._looks_russian_by_text(txt)
+
+    def search(self, query: str, limit: int = 20) -> List[dict]:
+        self.ensure_index_current_for_send()
+        tokens = [t.lower() for t in re.split(r'\s+', query.strip()) if t.strip()]
+        language = str(self.cfg.get('language', 'ru')).lower().strip()
+        out = []
+        for b in self._iter_books():
+            if language == 'ru' and not self._is_russian_book(b):
+                continue
+            hay = f"{b.get('authors','')} {b.get('title','')}".lower()
+            if all(t in hay for t in tokens):
+                result = dict(b)
+                result['authors'] = self._normalize_authors(result.get('authors', ''))
+                result['download_epub'] = f"https://flibusta.is/b/{b['file_base']}/epub"
+                result['book_id'] = b.get('file_base') or b.get('book_id')
+                out.append(result)
+                if len(out) >= limit:
+                    break
+        return out
+
     def fetch_book_epub(self, book: dict, out_dir: Path) -> Path:
         return self.delivery.fetch_book_epub(book, out_dir)
 

@@ -243,6 +243,32 @@ class LibraryBotCore:
         }
         self._save_user_prefs(prefs)
 
+    @staticmethod
+    def _parse_send_indexes(text: str) -> List[int]:
+        return [int(x.strip()) for x in text.split(',') if x.strip().isdigit()]
+
+    def _select_books_by_indexes(self, tg_id: str, idxs: List[int]) -> List[dict]:
+        last = self._load_last_results().get(tg_id, [])
+        return [last[i - 1] for i in idxs if 1 <= i <= len(last)]
+
+    def _mark_books_sent(self, tg_id: str, selected: List[dict]) -> None:
+        sent_idx = self._load_sent_index()
+        sent_for_user = sent_idx.get(tg_id, {})
+        now_ts = int(time.time())
+        for b in selected:
+            sent_for_user[b.get('book_id')] = now_ts
+        sent_idx[tg_id] = sent_for_user
+        self._save_sent_index(sent_idx)
+
+    def _deliver_books(self, tg_id: str, selected: List[dict], to_email: str | None, duplicate: bool = False) -> tuple[int, str]:
+        self.ensure_index_current_for_send()
+        with tempfile.TemporaryDirectory(prefix='librarybot_') as td:
+            td_path = Path(td)
+            epubs = [self.fetch_book_epub(b, td_path) for b in selected]
+            parts, target_email = self.send_epubs_by_email(tg_id, epubs, to_email_override=to_email)
+        self._mark_books_sent(tg_id, selected)
+        self._append_send_log(tg_id, target_email, selected, parts, duplicate=duplicate)
+        return parts, target_email
 
     @staticmethod
     def _books_human_list(books: List[dict]) -> str:
@@ -676,17 +702,15 @@ class LibraryBotCore:
                                 send(chat_id, text_page, reply_markup=menu_kb)
 
                     elif text.startswith('/send '):
-                        idxs = [int(x.strip()) for x in text[len('/send '):].split(',') if x.strip().isdigit()]
+                        idxs = self._parse_send_indexes(text[len('/send '):])
                         last = self._load_last_results().get(tg_id, [])
                         if not last:
                             send(chat_id, 'Сначала сделай /search', reply_markup=menu_kb)
                             continue
-                        selected = [last[i-1] for i in idxs if 1 <= i <= len(last)]
+                        selected = self._select_books_by_indexes(tg_id, idxs)
                         if not selected:
                             send(chat_id, 'Не выбраны валидные индексы.', reply_markup=menu_kb)
                             continue
-
-                        self.ensure_index_current_for_send()
 
                         dup = [b for b in selected if b.get('book_id') in sent_for_user]
                         if dup:
@@ -699,20 +723,7 @@ class LibraryBotCore:
                             send(chat_id, f'⚠️ Эти книги уже отправлялись: {dup_titles}. Повторить отправку? Ответь: ДА или НЕТ', reply_markup=menu_kb)
                             continue
 
-                        with tempfile.TemporaryDirectory(prefix='librarybot_') as td:
-                            td = Path(td)
-                            epubs = []
-                            for b in selected:
-                                epubs.append(self.fetch_book_epub(b, td))
-                            parts, target_email = self.send_epubs_by_email(tg_id, epubs, to_email_override=pref.get('email'))
-
-                        now_ts = int(time.time())
-                        sent_for_user = self._load_sent_index().get(tg_id, {})
-                        for b in selected:
-                            sent_for_user[b.get('book_id')] = now_ts
-                        sent_idx[tg_id] = sent_for_user
-                        self._save_sent_index(sent_idx)
-                        self._append_send_log(tg_id, target_email, selected, parts, duplicate=False)
+                        parts, target_email = self._deliver_books(tg_id, selected, pref.get('email'), duplicate=False)
                         sent_books = self._books_human_list(selected)
                         send(chat_id, f'{sent_books} отправлена(ы) на {target_email}', reply_markup=menu_kb)
 
@@ -739,19 +750,17 @@ class LibraryBotCore:
                                 send(chat_id, text_page, reply_markup=menu_kb)
 
                     elif st.get('await') == 'send_indexes':
-                        idxs = [int(x.strip()) for x in text.split(',') if x.strip().isdigit()]
+                        idxs = self._parse_send_indexes(text)
                         last = self._load_last_results().get(tg_id, [])
                         state[tg_id] = {}
                         self._save_dialog_state(state)
                         if not last:
                             send(chat_id, 'Сначала сделай /search', reply_markup=menu_kb)
                             continue
-                        selected = [last[i-1] for i in idxs if 1 <= i <= len(last)]
+                        selected = self._select_books_by_indexes(tg_id, idxs)
                         if not selected:
                             send(chat_id, 'Не выбраны валидные индексы.', reply_markup=menu_kb)
                             continue
-
-                        self.ensure_index_current_for_send()
 
                         dup = [b for b in selected if b.get('book_id') in sent_for_user]
                         if dup:
@@ -764,20 +773,7 @@ class LibraryBotCore:
                             send(chat_id, f'⚠️ Эти книги уже отправлялись: {dup_titles}. Повторить отправку? Ответь: ДА или НЕТ', reply_markup=menu_kb)
                             continue
 
-                        with tempfile.TemporaryDirectory(prefix='librarybot_') as td:
-                            td = Path(td)
-                            epubs = []
-                            for b in selected:
-                                epubs.append(self.fetch_book_epub(b, td))
-                            parts, target_email = self.send_epubs_by_email(tg_id, epubs, to_email_override=pref.get('email'))
-
-                        now_ts = int(time.time())
-                        sent_for_user = self._load_sent_index().get(tg_id, {})
-                        for b in selected:
-                            sent_for_user[b.get('book_id')] = now_ts
-                        sent_idx[tg_id] = sent_for_user
-                        self._save_sent_index(sent_idx)
-                        self._append_send_log(tg_id, target_email, selected, parts, duplicate=False)
+                        parts, target_email = self._deliver_books(tg_id, selected, pref.get('email'), duplicate=False)
                         send(chat_id, f'Отправлено писем: {parts} на {target_email}', reply_markup=menu_kb)
 
                     elif st.get('await') == 'confirm_resend':
@@ -790,21 +786,7 @@ class LibraryBotCore:
                                 send(chat_id, 'Не нашёл книги для повторной отправки. Сделай /search заново.', reply_markup=menu_kb)
                                 continue
 
-                            self.ensure_index_current_for_send()
-
-                            with tempfile.TemporaryDirectory(prefix='librarybot_') as td:
-                                td = Path(td)
-                                epubs = []
-                                for b in selected:
-                                    epubs.append(self.fetch_book_epub(b, td))
-                                parts, target_email = self.send_epubs_by_email(tg_id, epubs, to_email_override=pref.get('email'))
-                            now_ts = int(time.time())
-                            sent_for_user = self._load_sent_index().get(tg_id, {})
-                            for b in selected:
-                                sent_for_user[b.get('book_id')] = now_ts
-                            sent_idx[tg_id] = sent_for_user
-                            self._save_sent_index(sent_idx)
-                            self._append_send_log(tg_id, target_email, selected, parts, duplicate=True)
+                            parts, target_email = self._deliver_books(tg_id, selected, pref.get('email'), duplicate=True)
                             state[tg_id] = {}
                             self._save_dialog_state(state)
                             sent_books = self._books_human_list(selected)

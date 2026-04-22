@@ -275,6 +275,10 @@ class LibraryBotCore:
         self.store.save_dialog_state(data)
 
     def _load_auth_state(self) -> Dict[str, dict]:
+        state = self.store.load_auth_state()
+        if state:
+            return state
+
         if self.users_path.exists():
             try:
                 users = json.loads(self.users_path.read_text(encoding='utf-8'))
@@ -299,6 +303,8 @@ class LibraryBotCore:
         return {}
 
     def _save_auth_state(self, data: Dict[str, dict]) -> None:
+        self.store.save_auth_state(data)
+
         users = {}
         if self.users_path.exists():
             try:
@@ -333,6 +339,10 @@ class LibraryBotCore:
         ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _load_user_prefs(self) -> Dict[str, dict]:
+        prefs = self.store.load_user_prefs()
+        if prefs:
+            return prefs
+
         if self.users_path.exists():
             try:
                 users = json.loads(self.users_path.read_text(encoding='utf-8'))
@@ -353,6 +363,8 @@ class LibraryBotCore:
         return {}
 
     def _save_user_prefs(self, data: Dict[str, dict]) -> None:
+        self.store.save_user_prefs(data)
+
         users = {}
         if self.users_path.exists():
             try:
